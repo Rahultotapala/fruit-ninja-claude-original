@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fruit Ninja – Hand Tracking</title>
+<style>
+  :root{--ink:#1b1230;--paper:#fff4e0;--lime:#b6e35a;--hot:#ff3d6e;--sun:#ffc43d}
+  *{box-sizing:border-box;margin:0}
+  html,body{height:100%;background:var(--ink);color:var(--paper);font-family:"Trebuchet MS","Segoe UI",sans-serif;overflow:hidden}
+  #stage{position:fixed;inset:0}
+  video{display:none}
+  canvas{position:absolute;inset:0;width:100%;height:100%}
+  #hud{position:absolute;top:14px;left:18px;right:18px;display:flex;justify-content:space-between;pointer-events:none;font-weight:800;font-size:clamp(20px,4vw,34px);text-shadow:0 3px 0 rgba(0,0,0,.35)}
+  #lives{letter-spacing:4px;color:var(--hot)}
+  #sig{position:absolute;bottom:10px;right:16px;font-style:italic;font-size:15px;opacity:.85;pointer-events:none}
+  #menu{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;background:rgba(27,18,48,.82);text-align:center;padding:24px}
+  #menu.hide{display:none}
+  h1{font-size:clamp(40px,9vw,88px);line-height:.95;color:var(--sun);transform:rotate(-3deg);text-shadow:4px 4px 0 var(--hot)}
+  #menu p{max-width:460px;line-height:1.5;font-size:17px}
+  button{font:inherit;font-weight:800;font-size:20px;padding:14px 34px;border:0;border-radius:40px;background:var(--lime);color:var(--ink);cursor:pointer;box-shadow:0 5px 0 #6f9a2a}
+  button:active{transform:translateY(3px);box-shadow:0 2px 0 #6f9a2a}
+  #status{font-size:14px;opacity:.8;min-height:20px}
+  .by{font-style:italic;opacity:.9}
+  @media (prefers-reduced-motion:reduce){h1{transform:none}}
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="cam" playsinline></video>
+  <canvas id="c"></canvas>
+  <div id="hud"><span id="score">Score 0</span><span id="lives">♥♥♥</span></div>
+  <div id="sig">by Rahul</div>
+  <div id="menu">
+    <h1>Fruit<br>Ninja</h1>
+    <p id="msg">Wave your index finger in front of the camera to slice fruit. Avoid the bombs. Miss three fruits and it's over. Mouse or touch works too.</p>
+    <button id="startCam">Play with camera</button>
+    <button id="startMouse" style="background:var(--sun);box-shadow:0 5px 0 #b88a1c">Play with mouse / touch</button>
+    <div id="status"></div>
+    <div class="by">Made by Rahul</div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js" crossorigin="anonymous"></script>
+<script>
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const video=document.getElementById('cam');
+const menu=document.getElementById('menu'),statusEl=document.getElementById('status');
+let W,H;
+function resize(){W=cv.width=innerWidth;H=cv.height=innerHeight}
+addEventListener('resize',resize);resize();
+
+const FRUITS=[
+ {e:'🍉',c:'#ff4d6d'},{e:'🍊',c:'#ffa94d'},{e:'🍎',c:'#ff5252'},
+ {e:'🍌',c:'#ffe066'},{e:'🍍',c:'#ffd43b'},{e:'🥝',c:'#94d82d'},{e:'🍓',c:'#fa5252'}
+];
+let objs=[],halves=[],particles=[],trail=[],score=0,lives=10,running=false,spawnT=0,t0=0,useCam=false,mirror=true;
+let pointer=null,lastPointer=null;
+
+function spawn(){
+  const bomb=Math.random()<Math.min(.08+score/1500,.22);
+  const f=FRUITS[Math.floor(Math.random()*FRUITS.length)];
+  const x=W*(.15+Math.random()*.7);
+  const size=Math.max(54,Math.min(W,H)*.1);
+  objs.push({x,y:H+size,vx:(W/2-x)*(.25+Math.random()*.35)/60*1.0,vy:-(H*.0215+Math.random()*H*.006),
+    g:H*.00048,r:size*.55,size,bomb,f,rot:0,vr:(Math.random()-.5)*.12,alive:true});
+}
+
+function burst(x,y,color,n=16){
+  for(let i=0;i<n;i++){const a=Math.random()*6.28,s=2+Math.random()*7;
+    particles.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s-2,life:1,color,r:2+Math.random()*4})}
+}
+
+function segHitsCircle(ax,ay,bx,by,cx,cy,r){
+  const dx=bx-ax,dy=by-ay,l2=dx*dx+dy*dy||1;
+  let t=((cx-ax)*dx+(cy-ay)*dy)/l2;t=Math.max(0,Math.min(1,t));
+  const px=ax+t*dx-cx,py=ay+t*dy-cy;return px*px+py*py<r*r;
+}
+
+function slice(a,b){
+  const speed=Math.hypot(b.x-a.x,b.y-a.y);
+  if(speed<8)return;
+  for(const o of objs){
+    if(!o.alive)continue;
+    if(segHitsCircle(a.x,a.y,b.x,b.y,o.x,o.y,o.r)){
+      o.alive=false;
+      if(o.bomb){burst(o.x,o.y,'#ffb703',40);lives=0;flash=1;}
+      else{
+        score++;burst(o.x,o.y,o.f.c,22);
+        const ang=Math.atan2(b.y-a.y,b.x-a.x);
+        for(const s of[-1,1])halves.push({x:o.x,y:o.y,vx:o.vx+s*Math.cos(ang+1.57)*3,vy:o.vy+s*Math.sin(ang+1.57)*3,
+          g:o.g,rot:o.rot,vr:s*.08,size:o.size,e:o.f.e,side:s,life:1});
+      }
+    }
+  }
+}
+
+let flash=0;
+function update(dt){
+  if(!running)return;
+  spawnT-=dt;
+  if(spawnT<=0){const n=1+(Math.random()<Math.min(.15+score/200,.6)?1:0)+(Math.random()<.15?1:0);
+    for(let i=0;i<n;i++)spawn();spawnT=Math.max(500,1100-score*8);}
+  for(const o of objs){
+    o.vy+=o.g*dt/16.7;o.x+=o.vx*dt/16.7;o.y+=o.vy*dt/16.7;o.rot+=o.vr;
+    if(o.y>H+o.size*1.2&&o.vy>0&&o.alive){o.alive=false;if(!o.bomb){lives--;}}
+  }
+  objs=objs.filter(o=>o.alive||false);
+  for(const h of halves){h.vy+=h.g*dt/16.7*1.2;h.x+=h.vx;h.y+=h.vy;h.rot+=h.vr;h.life-=.012}
+  halves=halves.filter(h=>h.life>0&&h.y<H+100);
+  for(const p of particles){p.x+=p.vx;p.y+=p.vy;p.vy+=.25;p.life-=.025}
+  particles=particles.filter(p=>p.life>0);
+  if(lives<=0)gameOver();
+}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  // background
+  if(useCam&&video.readyState>=2){
+    ctx.save();ctx.globalAlpha=.35;
+    if(mirror){ctx.translate(W,0);ctx.scale(-1,1)}
+    const vr=video.videoWidth/video.videoHeight,cr=W/H;let dw=W,dh=H,dx=0,dy=0;
+    if(vr>cr){dw=H*vr;dx=(W-dw)/2}else{dh=W/vr;dy=(H-dh)/2}
+    ctx.drawImage(video,dx,dy,dw,dh);ctx.restore();
+  }
+  const g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'rgba(60,30,90,.75)');g.addColorStop(1,'rgba(27,18,48,.9)');
+  ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  for(const o of objs){
+    ctx.save();ctx.translate(o.x,o.y);ctx.rotate(o.rot);
+    ctx.font=o.size+'px serif';ctx.fillText(o.bomb?'💣':o.f.e,0,0);ctx.restore();
+  }
+  for(const h of halves){
+    ctx.save();ctx.globalAlpha=Math.max(0,h.life);ctx.translate(h.x,h.y);ctx.rotate(h.rot);
+    ctx.beginPath();
+    if(h.side<0)ctx.rect(-h.size,-h.size,h.size,h.size*2);else ctx.rect(0,-h.size,h.size,h.size*2);
+    ctx.clip();ctx.font=h.size+'px serif';ctx.fillText(h.e,0,0);ctx.restore();
+  }
+  for(const p of particles){ctx.globalAlpha=Math.max(0,p.life);ctx.fillStyle=p.color;
+    ctx.beginPath();ctx.arc(p.x,p.y,p.r,0,6.28);ctx.fill()}
+  ctx.globalAlpha=1;
+
+  // blade trail
+  const now=performance.now();
+  trail=trail.filter(p=>now-p.t<220);
+  if(trail.length>1){
+    ctx.lineCap='round';ctx.lineJoin='round';
+    for(let i=1;i<trail.length;i++){
+      const k=i/trail.length;
+      ctx.strokeStyle=`rgba(255,255,255,${k})`;ctx.lineWidth=2+k*12;
+      ctx.beginPath();ctx.moveTo(trail[i-1].x,trail[i-1].y);ctx.lineTo(trail[i].x,trail[i].y);ctx.stroke();
+    }
+  }
+  if(pointer&&useCam){ctx.fillStyle='#b6e35a';ctx.beginPath();ctx.arc(pointer.x,pointer.y,10,0,6.28);ctx.fill()}
+  if(flash>0){ctx.fillStyle=`rgba(255,80,80,${flash})`;ctx.fillRect(0,0,W,H);flash-=.03}
+
+  document.getElementById('score').textContent='Score '+score;
+  document.getElementById('lives').textContent='♥'.repeat(Math.max(0,lives))+'♡'.repeat(Math.max(0,3-lives));
+}
+
+function movePointer(x,y){
+  const p={x,y,t:performance.now()};
+  trail.push(p);
+  if(pointer&&running)slice(pointer,p);
+  pointer=p;
+}
+
+let last=performance.now();
+function loop(now){const dt=Math.min(40,now-last);last=now;update(dt);draw();requestAnimationFrame(loop)}
+requestAnimationFrame(loop);
+
+function startGame(){
+  objs=[];halves=[];particles=[];trail=[];score=0;lives=10;spawnT=300;running=true;pointer=null;flash=0;
+  menu.classList.add('hide');
+}
+function gameOver(){
+  running=false;
+  document.querySelector('h1').innerHTML='Game<br>Over';
+  document.getElementById('msg').textContent='You sliced '+score+' fruit'+(score===1?'':'s')+'. Nice work!';
+  document.getElementById('startCam').textContent=useCam?'Play again':'Play with camera';
+  document.getElementById('startMouse').textContent='Play with mouse / touch';
+  menu.classList.remove('hide');
+}
+
+// Mouse / touch
+cv.addEventListener('pointermove',e=>{if(!useCam&&running)movePointer(e.clientX,e.clientY)});
+cv.addEventListener('pointerdown',e=>{if(!useCam)pointer={x:e.clientX,y:e.clientY,t:performance.now()}});
+cv.style.touchAction='none';
+
+document.getElementById('startMouse').onclick=()=>{useCam=false;startGame()};
+
+// MediaPipe hand tracking
+let handsReady=false,hands,cameraUtil;
+document.getElementById('startCam').onclick=async()=>{
+  useCam=true;
+  if(handsReady){startGame();return}
+  if(typeof Hands==='undefined'||typeof Camera==='undefined'){
+    statusEl.textContent='Could not load MediaPipe. Check your internet connection, or play with mouse.';return}
+  statusEl.textContent='Loading hand tracking model, allow camera access…';
+  try{
+    hands=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}`});
+    hands.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:.6,minTrackingConfidence:.5});
+    hands.onResults(r=>{
+      if(!handsReady){handsReady=true;statusEl.textContent='';startGame()}
+      if(!r.multiHandLandmarks||!r.multiHandLandmarks.length){pointer=null;return}
+      for(const lm of r.multiHandLandmarks){
+        const tip=lm[8];
+        const x=(mirror?1-tip.x:tip.x)*W,y=tip.y*H;
+        // each hand slices independently
+        const p={x,y,t:performance.now()};
+        trail.push(p);
+        if(pointer&&running)slice(pointer,p);
+        pointer=p;
+      }
+    });
+    cameraUtil=new Camera(video,{onFrame:async()=>{await hands.send({image:video})},width:640,height:480});
+    await cameraUtil.start();
+  }catch(err){
+    statusEl.textContent='Camera unavailable: '+err.message+'. Try mouse mode.';useCam=false;
+  }
+};
+</script>
+</body>
+</html>
